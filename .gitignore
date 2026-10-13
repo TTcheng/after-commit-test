@@ -1,0 +1,86 @@
+### IntelliJ IDEA ###
+.idea/
+*.iml
+*.iws
+*.ipr
+
+### VS Code ###
+.vscode/
+
+### Eclipse ###
+.classpath
+.project
+.settings/
+.factorypath
+bin/
+
+### NetBeans ###
+nbproject/private/
+.nb-gradle/
+nbbuild/
+dist/
+nbdist/
+.nb-build/
+
+### Spring Boot ###
+HELP.md
+target/
+!**/src/main/**/target/
+!**/src/test/**/target/
+
+### Logs ###
+*.log
+logs/
+
+### OS ###
+.DS_Store
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+### Maven ###
+.mvn/wrapper/maven-wrapper.jar
+!**/.mvn/wrapper/maven-wrapper.properties
+
+### Build output ###
+build/
+out/
+*.class
+*.jar
+*.war
+*.nar
+*.ear
+*.zip
+*.tar.gz
+*.rar
+hs_err_pid*
+
+### IDE specific files ###
+*.swp
+*.swo
+*~
+.idea_modules/
+
+### Local config ###
+.env
+.env.local
+*.local
+
+### Java ###
+*.hprof
+
+### Test outputs ###
+test-output/
+test-results/
+surefire-reports/
+*.html
+*.xml
+!pom.xml
+
+### Tools ###
+.tool-versions
+.fvm/
+
+# Note: Don't ignore README.md, .gitignore, or .github/ if present
+!/.github/
