@@ -23,6 +23,24 @@
 
 对于 `@TransactionalEventListener` 来说，配置 `SimpleApplicationEventMulticaster.setErrorHandler()` **不会改变任何可观察的行为**（multicaster 级别的 errorHandler 在事务监听链路上被旁路）。它只对 `@EventListener`（非事务）有意义。
 
+### 字节码层面的直接证据
+
+不依赖日志推断，直接看 `spring-tx-6.1.6.jar` 中
+`TransactionSynchronizationUtils.invokeAfterCompletion` 的字节码：
+
+```
+32: invokeinterface  TransactionSynchronization.afterCompletion:(I)V   ← try 只包住这一次调用
+40: astore 4                                                          ← catch
+45: ldc "TransactionSynchronization.afterCompletion threw exception"
+54: goto 11                                                           ← 跳回 hasNext()，继续下一个
+
+Exception table:
+   from    to  target type
+      30    37    40   Class java/lang/Throwable
+```
+
+三点一目了然：try/catch **只包单次调用**；捕获类型是 `Throwable`（什么都吞）；记完日志 `goto 11` **跳回循环**。所以"C 仍然执行"是机制必然，不是巧合。
+
 ---
 
 ## 项目结构
@@ -47,27 +65,48 @@ after-commit-test/
     │   └── resources/application.yml
     └── test/java/com/example/aftercommit/
         ├── DefaultMulticasterTest.java          # 默认行为
-        └── ErrorHandlerMulticasterTest.java     # 启用 ErrorHandler profile
+        ├── ErrorHandlerMulticasterTest.java     # 启用 ErrorHandler profile
+        └── OrderControllerWebTest.java          # HTTP 层：200 结论 + 请求级错误对照
 ```
 
 ---
 
 ## 如何运行
 
-环境：JDK 17 + Maven 3.9+（本机已装在 `D:\Environment\`）。
+需要 JDK 17 与 Maven 3.9+。本机**没有把 `java` / `mvn` 加进 PATH**，且预置的本地仓库在
+`D:\Environment\Maven\maven-repo`（Maven 默认会去空的 `~/.m2/repository`，导致离线解析父 POM 失败）。可直接用：
 
-```bash
+```powershell
 cd D:\Workspace\MiniMax\after-commit-test
-mvn test
+$env:JAVA_HOME = 'D:\Environment\Java\jdk-17.0.20.1+1'
+& 'D:\Environment\Maven\apache-maven-3.9.16\bin\mvn.cmd' -o "-Dmaven.repo.local=D:\Environment\Maven\maven-repo" test
 ```
 
-观察日志：
-- `[Service] committed-order id=1, publishing event 1`
-- `[ListenerA] DONE event=order-1`
-- `[ListenerB] START event=order-1 -- about to throw`
-- Spring 输出 `TransactionSynchronization.afterCompletion threw exception` ERROR 日志（含 ListenerB 完整堆栈）
-- `[ListenerC] START event=order-1`  ← **依然执行了**
-- `[ListenerC] DONE event=order-1`
+> 注意 `-D` 参数要用**双引号整体包住**。用单引号时 PowerShell 会原样传给 Maven，
+> `.repo.local=D` 会被当成 goal 前缀而报 `No plugin found for prefix`。
+
+若 `java` / `mvn` 已在 PATH 且走默认仓库，则直接 `mvn test` 即可。
+
+预期：`Tests run: 4, Failures: 0, Errors: 0, Skipped: 0` → `BUILD SUCCESS`。
+
+### 观察到的日志（一次 HTTP 请求的完整时序）
+
+```
+[Service]     saved (NOT yet committed) order id=1, publishing event 1
+[Service]     publishEvent returned -- listeners only registered, commit still pending
+[ListenerA]   START event=order-1 (transaction already committed)
+[ListenerA]   DONE event=order-1
+[ListenerB]   START event=order-1 -- about to throw
+ERROR o.s.t.s.TransactionSynchronizationUtils : TransactionSynchronization.afterCompletion threw exception
+[ListenerC]   START event=order-1        ← 依然执行
+[ListenerC]   DONE event=order-1
+[Controller]  returning 200 for order id=1
+```
+
+注意 `[Controller] returning 200` 出现在 **ListenerC 之后**——异常根本没机会影响响应码。
+
+> `OrderService` 里特意打印 "saved (NOT yet committed)"：`GenerationType.IDENTITY` 会立即 INSERT，
+> 所以 id 已经生成，但**此刻事务尚未提交、仍可回滚**。提交发生在 `@Transactional` 代理退出时。
 
 ---
 
@@ -83,17 +122,36 @@ mvn test
 | ListenerC **也**执行了 | ✅ | ✅ |
 | 异常被 Spring 记录到日志 | ✅ | ✅ |
 
+监听器断言放在 `placeOrder()` 返回后**立即**执行、不做任何 sleep —— 这本身就是"AFTER_COMMIT
+监听器在提交线程上同步完成"的正面证据。
+
 ### `ErrorHandlerMulticasterTest`
 
 | 断言 | 期望 | 实测结果 |
 |------|------|---------|
 | `placeOrder()` 正常返回 | ✅ | ✅ |
 | 事务已提交 | ✅ | ✅ |
-| ListenerA 已执行 | ✅ | ✅ |
-| ListenerC **也**执行了 | ✅ | ✅ |
+| ListenerA / ListenerC 都执行了 | ✅ | ✅ |
 | 异常被 Spring 记录到日志 | ✅ | ✅ |
+| **具名 bean `applicationEventMulticaster` 确实生效且被容器使用** | ✅ | ✅ |
+| **`[ErrorHandler]` 日志行始终不出现**（证明被旁路而非闲置） | ✅ | ✅ |
 
-**两个测试结论完全一致**——对于 `@TransactionalEventListener`，配置 errorHandler 不会改变任何可观察行为。
+后两条是这个测试**能够失败**的关键：删掉 `EventMulticasterConfig` 或摘掉 profile，
+上下文启动就会失败，测试不会再"空转通过"。
+
+### `OrderControllerWebTest`
+
+| 断言 | 期望 | 实测结果 |
+|------|------|---------|
+| ListenerB 抛异常时 `POST /orders` | **HTTP 200** | ✅ |
+| 响应体含正确的 id / product / quantity | ✅ | ✅ |
+| 数据确实已落库（不是"回滚后假装成功"） | ✅ | ✅ |
+| 同一次请求内 A / B / C 三个监听器都跑过 | ✅ | ✅ |
+| 请求本身非法（缺 product） | **HTTP 400** | ✅ |
+
+最后一行是对照组：**只有监听器异常被静默吞掉，请求级错误仍会正常冒泡。**
+
+**三个测试结论完全一致**——对于 `@TransactionalEventListener`，配置 errorHandler 不会改变任何可观察行为。
 
 ---
 
@@ -117,9 +175,9 @@ ApplicationListenerMethodAdapter.doInvoke
   ↓
 ApplicationListenerMethodAdapter.processEvent
   ↓
-TransactionalApplicationListenerSynchronization.processEventWithCallbacks   ← line 65
+TransactionalApplicationListenerSynchronization.processEventWithCallbacks
   ↓
-TransactionalApplicationListenerSynchronization$PlatformSynchronization.afterCompletion   ← line 118
+TransactionalApplicationListenerSynchronization$PlatformSynchronization.afterCompletion
   ↓
 TransactionSynchronizationUtils.invokeAfterCompletion  ← 这里 try/catch 吞掉，记 ERROR 日志
   ↓
@@ -140,12 +198,30 @@ AbstractPlatformTransactionManager.processCommit
 
 > **问**:在 springboot 项目中,同一个请求中的同一个事件存在多个 aftercommit 监听,若其中一个监听抛出异常,请求是否会失败,其他监听是否会执行
 
-| 问题点 | 正确答案 |
-|--------|---------|
-| 请求失败? | **不会**(异常被吞,HTTP 200) |
-| 其他监听是否执行? | **都会执行**(每个监听器独立同步,互不影响) |
-| 数据是否落库? | **是**(AFTER_COMMIT 在 commit 之后才触发) |
-| 事务能回滚吗? | **不能**(commit 已完成) |
+| 问题点 | 正确答案 | 验证它的测试 |
+|--------|---------|-------------|
+| 请求失败? | **不会**(异常被吞,HTTP 200) | `OrderControllerWebTest` |
+| 其他监听是否执行? | **都会执行**(每个监听器独立同步,互不影响) | `DefaultMulticasterTest` |
+| 数据是否落库? | **是**(AFTER_COMMIT 在 commit 之后才触发) | `DefaultMulticasterTest` |
+| 事务能回滚吗? | **不能**(commit 已完成) | `DefaultMulticasterTest` |
+| 配 errorHandler 有用吗? | **没用**(在事务链路上被旁路) | `ErrorHandlerMulticasterTest` |
+
+---
+
+## 附:两个容易踩的版本坑
+
+1. **`ApplicationEventMulticaster` 的包名在 Spring 6 变过。**
+   Spring 5.x 是 `org.springframework.context.ApplicationEventMulticaster`；
+   Spring Framework 6.0 起移到 `org.springframework.context.event.ApplicationEventMulticaster`
+   （与 `SimpleApplicationEventMulticaster` 同包）。沿用旧 import 会直接编译失败。
+
+2. **Boot 3.x 已经没有 `SimpleApplicationEventMulticasterAutoConfiguration` 了。**
+   实测 `spring-boot-autoconfigure-3.2.5.jar` 中不存在任何 `*Multicaster*` 类，
+   `autoconfigure.context` 包只剩 8 个类。因此**不存在"覆盖 Boot 默认多播器"这回事**——
+   没有 `ApplicationEventMulticaster` bean 时，`AbstractApplicationContext` 会自行
+   `new SimpleApplicationEventMulticaster()` 兜底（且不带 errorHandler）。
+   自定义 `@Bean applicationEventMulticaster` 依然有效（容器按类型取用），
+   但理由和 Boot 2.x 时已经不同了。
 
 ---
 

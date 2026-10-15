@@ -1,5 +1,7 @@
 package com.example.aftercommit;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestMapping;
@@ -7,15 +9,24 @@ import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
 /**
- * Default behavior note:
+ * {@code POST /orders?product=...&quantity=...}
  *
- * The try-catch here will NOT catch exceptions thrown by AFTER_COMMIT listeners --
- * those are swallowed by Spring at the TransactionSynchronization level (logged only).
- * This catch is still useful for non-listener exceptions (DB errors, validation, etc.).
+ * <p>The try/catch below will NOT catch exceptions thrown by AFTER_COMMIT listeners: Spring has
+ * already swallowed them (inside {@code processCommit}) and only logged them at ERROR. This catch
+ * still matters for ordinary failures -- constraint violations, validation, downstream errors --
+ * which do surface here and correctly produce a 500.
+ *
+ * <p>The two paths are covered separately:
+ * <ul>
+ *   <li>{@code OrderControllerWebTest} -- AFTER_COMMIT listener throws -> still HTTP 200.</li>
+ *   <li>{@code OrderControllerWebTest#badRequestIsNotSwallowed} -> request-level failure -> HTTP 400.</li>
+ * </ul>
  */
 @RestController
 @RequestMapping("/orders")
 public class OrderController {
+
+    private static final Logger log = LoggerFactory.getLogger(OrderController.class);
 
     private final OrderService orderService;
 
@@ -27,12 +38,11 @@ public class OrderController {
     public ResponseEntity<?> create(@RequestParam String product, @RequestParam int quantity) {
         try {
             Order o = orderService.placeOrder(product, quantity);
-            System.out.println("[Controller] returned OK for order id=" + o.getId());
+            log.info("[Controller] returning 200 for order id={}", o.getId());
             return ResponseEntity.ok(o);
         } catch (Exception e) {
-            // This branch triggers for non-listener exceptions. AFTER_COMMIT listener
-            // exceptions are swallowed by Spring and never reach here.
-            System.out.println("[Controller] caught non-listener exception: " + e);
+            // AFTER_COMMIT listener exceptions never reach here -- see the class javadoc.
+            log.error("[Controller] caught non-listener exception, returning 500", e);
             return ResponseEntity.internalServerError().body(e.getMessage());
         }
     }
