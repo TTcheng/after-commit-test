@@ -1,27 +1,28 @@
 # AFTER_COMMIT 多监听器异常行为验证
 
-回答原问题：**同一个请求、同一事件存在多个 `@TransactionalEventListener(AFTER_COMMIT)` 监听器，若其中一个抛出异常——**
+## 问题
 
-- 事务已经提交，数据已落库（无法回滚）
-- 异常监听器**之前的监听器已执行**
-- 异常监听器**之后的监听器也会执行**（不是 default multicaster 的循环中断模型）
-- 异常被 Spring 在 `TransactionSynchronizationUtils.invokeAfterCompletion` 处**静默吞掉并记录 ERROR 日志**
-- 调用方**不会收到异常**，HTTP 请求**仍然返回 200**
+在 Spring Boot 项目中，同一个请求中的同一个事件存在多个 `@TransactionalEventListener(AFTER_COMMIT)` 监听器，若其中一个监听抛出异常：
+
+1. **请求是否会失败？**
+2. **其他监听是否会执行？**
+
+## 答案
+
+1. **请求不会失败。** 异常被 Spring 在 `TransactionSynchronizationUtils.invokeAfterCompletion` 处静默吞掉，只记录一条 ERROR 日志；调用方收不到异常，HTTP 仍然返回 200。此时事务早已提交，数据已落库，无法回滚。
+
+2. **其他监听全部会执行。** 包括异常监听器后面的那些。每个 `@TransactionalEventListener` 方法都被单独注册为一个 `TransactionSynchronization`，而 `invokeAfterCompletion` 对每一次 `afterCompletion` 调用各自包了一层 try/catch，所以一个监听抛异常不会阻断其他监听。
 
 ---
 
 ## ⚠️ 重要事实更正
 
-之前两轮回答里有两处错误，已经通过运行测试纠正：
+前两轮回答里有两处错误，已通过运行测试纠正：
+
 1. ❌ ~~"默认 multicaster 让循环中断，B 之后的监听器不执行"~~ → ✅ **所有监听器都会执行**
 2. ❌ ~~"ErrorHandler 配置后所有监听器都执行"~~ → ✅ **不加 ErrorHandler，所有监听器也都执行**
 
-正确机制是：**每个 `@TransactionalEventListener` 方法都被 Spring 单独注册为一个 `TransactionalApplicationListenerSynchronization`**。`TransactionSynchronizationUtils.invokeAfterCompletion` 在外层循环里逐个调用每个 synchronization 的 `afterCompletion`，每次调用都包在自己的 try/catch 里。所以：
-
-- 某个监听器抛异常 → 仅该 synchronization 抛出 → `invokeAfterCompletion` 的 try/catch 吞掉 → 其他 synchronization **不受影响，继续执行** → 全部监听器都跑了
-- 异常一路向上冒泡，最终被 `TransactionSynchronizationUtils` 捕获并以 ERROR 级别日志输出，但**不会**返回给调用方
-
-对于 `@TransactionalEventListener` 来说，配置 `SimpleApplicationEventMulticaster.setErrorHandler()` **不会改变任何可观察的行为**（multicaster 级别的 errorHandler 在事务监听链路上被旁路）。它只对 `@EventListener`（非事务）有意义。
+另有一个独立结论：**给 multicaster 配置 `SimpleApplicationEventMulticaster.setErrorHandler()` 对 `@TransactionalEventListener` 无效**。异常在事务同步层就被吞掉了，根本没回到 multicaster，errorHandler 不会被调用——它只对非事务的 `@EventListener` 有意义。
 
 ### 字节码层面的直接证据
 
